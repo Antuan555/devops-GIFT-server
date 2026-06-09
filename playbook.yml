@@ -1,0 +1,173 @@
+---
+# ЭТАП 1: Сборка и подготовка кода на управляющей ноде (balancer-db)
+- hosts: localhost
+  connection: local
+  vars:
+    redmine_port: 8085
+  vars_files:
+    - group_vars/webservers/vault.yml
+
+  tasks:
+    - name: Очистка старой папки с кодом (если она была)
+      file:
+        path: /home/student/app-src
+        state: absent
+      tags: [ "deploy" ]
+
+    - name: Клонирование Git репозитория проекта (Shell)
+      shell: "git clone https://github.com/uvrdem1/Moodle-GIFT-gen.git /home/student/app-src"
+      tags: [ "deploy" ]
+
+    - name: Исправление регистра путей (баг Windows-разработки)
+      shell: |
+        sed -i -E 's|'\./pages/home'|'./pages/Home'|g; s|"\./pages/home"|"./pages/Home"|g' /home/student/app-src/frontend/src/App.* || true
+      tags: [ "deploy" ]
+
+    - name: Установка dependencies Фронтенда (npm install)
+      shell: "npm install"
+      args:
+        chdir: "/home/student/app-src/frontend"
+      tags: [ "deploy" ]
+
+    - name: Сборка статики Фронтенда (npm run build)
+      shell: "npm run build"
+      args:
+        chdir: "/home/student/app-src/frontend"
+      tags: [ "deploy" ]
+
+    - name: Принудительное создание правильного автономного Dockerfile.backend
+      copy:
+        dest: /home/student/app-src/Dockerfile.backend
+        content: |
+          FROM python:3.12-slim
+          WORKDIR /app
+          RUN pip install --no-cache-dir django djangorestframework djangorestframework-simplejwt django-cors-headers python-dotenv requests pydantic gunicorn
+          COPY backend/ /app/
+          RUN rm -rf /app/venv || true
+          CMD sh -c "python manage.py migrate --noinput || true && python manage.py runserver 0.0.0.0:8000"
+      tags: [ "deploy" ]
+
+    - name: Принудительное создание правильного Dockerfile.frontend
+      copy:
+        dest: /home/student/app-src/Dockerfile.frontend
+        content: |
+          FROM nginx:alpine
+          RUN echo 'server { listen 80; location / { root /usr/share/nginx/html; index index.html; try_files $uri $uri/ /index.html; } }' > /etc/nginx/conf.d/default.conf
+          COPY frontend/dist/ /usr/share/nginx/html/
+          EXPOSE 80
+          CMD ["nginx", "-g", "daemon off;"]
+      tags: [ "deploy" ]
+
+    - name: Создание архива для отправки на целевые серверы
+      archive:
+        path: /home/student/app-src
+        dest: /home/student/app-package.tar.gz
+        format: gz
+      tags: [ "deploy" ]
+
+# ЭТАП 2: Настройка окружения на серверах приложений
+- hosts: all
+  become: true
+  vars:
+    redmine_port: 8085
+    db_host: "10.0.2.6"
+    db_name: "mydb"
+    db_user: "myuser"
+    db_password: "{{ vault_db_password }}"
+  vars_files:
+    - group_vars/webservers/vault.yml
+
+  roles:
+    - role: geerlingguy.pip
+      tags: [ "setup" ]
+    - role: geerlingguy.docker
+      tags: [ "setup" ]
+
+  tasks:
+    - name: Создание структуры папок для деплоя
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: student
+        group: student
+        mode: "0755"
+      with_items:
+        - /home/student/diploma-project
+        - /home/student/redmine-app
+      tags: [ "deploy" ]
+
+    - name: Распаковка пакета с кодом приложения на server-1 и server-2
+      unarchive:
+        src: /home/student/app-package.tar.gz
+        dest: /home/student/diploma-project/
+        owner: student
+        group: student
+      tags: [ "deploy" ]
+
+    - name: Сборка Docker-образа Бэкенда (Django)
+      community.docker.docker_image:
+        name: diploma-backend
+        build:
+          path: /home/student/diploma-project/app-src
+          dockerfile: Dockerfile.backend
+          nocache: true
+        source: build
+      tags: [ "deploy" ]
+
+    - name: Сборка Docker-образа Фронтенда (React)
+      community.docker.docker_image:
+        name: diploma-frontend
+        build:
+          path: /home/student/diploma-project/app-src
+          dockerfile: Dockerfile.frontend
+          nocache: true
+        source: build
+      tags: [ "deploy" ]
+
+    - name: Запуск контейнера Бэкенда (Django API)
+      community.docker.docker_container:
+        name: api-backend
+        image: diploma-backend
+        state: started
+        restart_policy: always
+        published_ports:
+          - "8000:8000"
+      tags: [ "deploy" ]
+
+    - name: Запуск контейнера Фронтенда (React)
+      community.docker.docker_container:
+        name: web-frontend
+        image: diploma-frontend
+        state: started
+        restart_policy: always
+        published_ports:
+          - "8081:80"
+      tags: [ "deploy" ]
+
+    - name: Генерация .env файла для Redmine
+      template:
+        src: templates/redmine.env.j2
+        dest: /home/student/redmine-app/redmine.env
+        mode: "0600"
+      tags: [ "deploy" ]
+
+    - name: Запуск вспомогательного Redmine
+      community.docker.docker_container:
+        name: redmine-server
+        image: redmine:5-alpine
+        state: started
+        restart_policy: always
+        published_ports:
+          - "{{ redmine_port }}:3000"
+        env_file: /home/student/redmine-app/redmine.env
+      tags: [ "deploy" ]
+
+    - name: Запуск агента Node Exporter
+      community.docker.docker_container:
+        name: node-exporter
+        image: prom/node-exporter:v1.8.0
+        state: started
+        restart_policy: always
+        published_ports:
+          - "9100:9100"
+      tags: [ "monitor" ]

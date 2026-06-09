@@ -1,0 +1,15 @@
+# Ссылка на зашифрованный ключ
+datadog_api_key: "{{ vault_datadog_api_key }}"
+
+# Указываем регион дата-центра (по умолчанию для новых аккаунтов это 'datadoghq.com')
+datadog_site: "datadoghq.com"
+
+# Настройка http_check для проверки доступности Redmine
+datadog_checks:
+  http_check:
+    init_config:
+    instances:
+      - name: "Redmine Application Check"
+        url: "http://localhost:8085/health" # Локальный адрес приложения на сервере
+        timeout: 5
+        check_hostname: true

@@ -1,0 +1,7 @@
+.vault_pass
+*.crt
+*.key
+*.tar.gz
+node_modules/
+dist/
+venv/
